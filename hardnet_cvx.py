@@ -31,8 +31,7 @@ def main():
     setproctitle(name+'-{}'.format(args['probType']))
     data = load_data(args, DEVICE)
 
-    save_dir = os.path.join('results', str(data), name+args['suffix'],
-        time.strftime("%y%m%d-%H%M%S", time.localtime(time.time())))
+    save_dir = os.path.join('results', str(data), name+args['suffix'], f"seed{args['seed']}")
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     with open(os.path.join(save_dir, 'args.dict'), 'wb') as f:
@@ -69,9 +68,9 @@ class HardNetCvx(nn.Module):
         self._args = args
         self._if_project = False
         layer_sizes = [data.encoded_xdim, self._args['hiddenSize'], self._args['hiddenSize']]
-        output_dim = data.ydim - data.neq - data.nknowns
+        output_dim = data.ydim
         
-        if self._args['probType'] == 'nonconvex': # follow DC3 paper's setting for reproducing its results
+        if self._args['probType'] == 'opt': # follow DC3 paper's setting for reproducing its results
             layers = reduce(operator.add,
                 [[nn.Linear(a,b), nn.BatchNorm1d(b), nn.ReLU(), nn.Dropout(p=0.2)]
                     for a,b in zip(layer_sizes[0:-1], layer_sizes[1:])])
@@ -93,17 +92,16 @@ class HardNetCvx(nn.Module):
         self._if_project = val
     
     def get_opt(self, x_single):
-        """Get the cvxpy optimization problem for projecting the output 
-        to satisfy the constraints"""
-        A, b = self._data.get_Ab_effective(x_single[None,:])
+        """Get the cvxpy optimization problem for projecting the output to satisfy the constraints"""
+        A, bl, bu = self._data.get_coefficients(x_single[None,:])
         raw_output = cp.Parameter(self._data.ydim)
         constrained_output = cp.Variable(self._data.ydim)
         obj = cp.Minimize(cp.sum_squares(raw_output - constrained_output))
-        constraints = [A[0].cpu() @ constrained_output <= b[0].cpu()]
+        constraints = [A[0].cpu() @ constrained_output >= bl[0].cpu(), A[0].cpu() @ constrained_output <= bu[0].cpu()]
         opt = cp.Problem(obj, constraints)
         return opt, raw_output, constrained_output
 
-    def apply_cvx_projection(self, f, x):
+    def apply_projection(self, f, x):
         """project f through differentiable convex optimization"""
         proj_f = torch.zeros_like(f)
         for i in range(len(f)):
@@ -117,9 +115,9 @@ class HardNetCvx(nn.Module):
         out = self._net(encoded_x)
 
         if self._if_project:
-            out = self.apply_cvx_projection(out, x)
+            out = self.apply_projection(out, x)
         
-        return self._data.complete_partial(x, out)
+        return out
 
 if __name__=='__main__':
     main()

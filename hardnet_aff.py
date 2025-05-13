@@ -29,8 +29,7 @@ def main():
     setproctitle(name+'-{}'.format(args['probType']))
     data = load_data(args, DEVICE)
 
-    save_dir = os.path.join('results', str(data), name+args['suffix'],
-        time.strftime("%y%m%d-%H%M%S", time.localtime(time.time())))
+    save_dir = os.path.join('results', str(data), name+args['suffix'], f"seed{args['seed']}")
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     with open(os.path.join(save_dir, 'args.dict'), 'wb') as f:
@@ -67,9 +66,9 @@ class HardNetAff(nn.Module):
         self._args = args
         self._if_project = False
         layer_sizes = [data.encoded_xdim, self._args['hiddenSize'], self._args['hiddenSize']]
-        output_dim = data.ydim - data.neq - data.nknowns
+        output_dim = data.ydim
 
-        if self._args['probType'] == 'nonconvex': # follow DC3 paper's setting for reproducing its results
+        if self._args['probType'] == 'opt': # follow DC3 paper's setting for reproducing its results
             layers = reduce(operator.add,
                 [[nn.Linear(a,b), nn.BatchNorm1d(b), nn.ReLU(), nn.Dropout(p=0.2)]
                     for a,b in zip(layer_sizes[0:-1], layer_sizes[1:])])
@@ -90,25 +89,27 @@ class HardNetAff(nn.Module):
         """set wether to do projection or not"""
         self._if_project = val
 
-    def apply_projection(self, f, A, b):
-        """project f to satisfy Af<=b"""
-        if self._args['probType'] == 'nonconvex': # efficient computation for input-independent A
-            A = A[0,:,:]
-            return f - (torch.linalg.pinv(A) @ nn.ReLU()(A @ f[:,:,None] - b[:,:,None]))[:,:,0]
+    def apply_projection(self, f, x):
+        """project f to satisfy bl<=Af<=bu"""
+        A, bl, bu = self._data.get_coefficients(x)
         
-        # return f - (torch.linalg.pinv(A) @ nn.ReLU()(A @ f[:,:,None] - b[:,:,None]))[:,:,0]
+        if self._args['probType'] == 'opt': # efficient computation for input-independent A (for fair comparison with DC3)
+            # A = A[0,:,:] A returned as a 2D tensor for opt
+            Af = A @ f[:,:,None]
+            return f + (torch.linalg.pinv(A) @ (nn.ReLU()(bl[:,:,None] - Af) - nn.ReLU()(Af - bu[:,:,None])))[:,:,0]
+        
         # listsq is more stable than pinv
-        return f - torch.linalg.lstsq(A, nn.ReLU()(A @ f[:,:,None] - b[:,:,None])).solution[:,:,0]
+        Af = A @ f[:,:,None]
+        return f + torch.linalg.lstsq(A, nn.ReLU()(bl[:,:,None] - Af) - nn.ReLU()(Af - bu[:,:,None])).solution[:,:,0]
 
     def forward(self, x, isTest=False):
         encoded_x = self._data.encode_input(x)
         out = self._net(encoded_x)
 
         if self._if_project:
-            A_eff, b_eff = self._data.get_Ab_effective(x)
-            out = self.apply_projection(out, A_eff, b_eff)
+            out = self.apply_projection(out, x)
         
-        return self._data.complete_partial(x, out)
+        return out
 
 if __name__=='__main__':
     main()

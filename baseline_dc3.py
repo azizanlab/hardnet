@@ -11,14 +11,15 @@ torch.set_default_dtype(torch.float64)
 import operator
 from functools import reduce
 
-import numpy as np
 import pickle
-import time
 from setproctitle import setproctitle
 import os
+import time
 import argparse
 
 from utils import add_common_args, get_dict_from_parser, load_data, train_net
+from hardnet_aff import HardNetAff
+from hardnet_cvx import HardNetCvx
 
 DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
@@ -29,15 +30,14 @@ def main():
     setproctitle(name+'-{}'.format(args['probType']))
     data = load_data(args, DEVICE)
 
-    save_dir = os.path.join('results', str(data), name+args['suffix'],
-        time.strftime("%y%m%d-%H%M%S", time.localtime(time.time())))
+    save_dir = os.path.join('results', str(data), name+args['suffix'], f"seed{args['seed']}")
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     with open(os.path.join(save_dir, 'args.dict'), 'wb') as f:
         pickle.dump(args, f)
 
     # Run method
-    train_net(data, args, NNSolver, save_dir)
+    train_net(data, args, DC3, save_dir)
 
 
 def get_args(name):
@@ -61,8 +61,8 @@ def get_args(name):
         help='learning rate for correction procedure')
     parser.add_argument('--corrMomentum', type=float,
         help='momentum for correction procedure')
-    parser.add_argument('--useTestProj', type=bool,
-        help='whether to use projection during testing')
+    parser.add_argument('--testProj', choices=['none', 'hardnetaff', 'hardnetcvx'], default='none',
+        help='projection to use during testing (for ablation study)')
     args = get_dict_from_parser(parser, name)
     print(f'{name}: {args}')
     return args
@@ -70,18 +70,16 @@ def get_args(name):
 
 ######### Models
 
-class NNSolver(nn.Module):
+class DC3(nn.Module):
     def __init__(self, data, args):
         super().__init__()
         self._data = data
         self._args = args
-        self._if_project = args['useTestProj']
+        self._testProj = args['testProj']
         layer_sizes = [data.encoded_xdim, self._args['hiddenSize'], self._args['hiddenSize']]
-        output_dim = data.ydim - data.nknowns
-        if self._args['useCompl']:
-            output_dim -= data.neq
+        output_dim = data.ydim - data.neq if self._args['useCompl'] else data.ydim
         
-        if self._args['probType'] == 'nonconvex': # follow DC3 paper's setting for reproducing its results
+        if self._args['probType'] == 'opt': # follow DC3 paper's setting for reproducing its results
             layers = reduce(operator.add,
                 [[nn.Linear(a,b), nn.BatchNorm1d(b), nn.ReLU(), nn.Dropout(p=0.2)]
                     for a,b in zip(layer_sizes[0:-1], layer_sizes[1:])])
@@ -96,7 +94,7 @@ class NNSolver(nn.Module):
             if type(layer) == nn.Linear:
                 nn.init.kaiming_normal_(layer.weight)
 
-        self.net = nn.Sequential(*layers)
+        self._net = nn.Sequential(*layers)
 
     def grad_steps(self, X, Y):
         take_grad_steps = self._args['useTrainCorr']
@@ -114,9 +112,7 @@ class NNSolver(nn.Module):
                 if partial_corr:
                     Y_step = self._data.get_ineq_partial_grad(X, Y_new)
                 else:
-                    ineq_step = self._data.get_ineq_grad(X, Y_new)
-                    eq_step = self._data.get_eq_grad(X, Y_new)
-                    Y_step = (1 - self._args['softWeightEqFrac']) * ineq_step + self._args['softWeightEqFrac'] * eq_step
+                    Y_step = self._data.get_resid_grad(X, Y_new)
                 new_Y_step = lr * Y_step + momentum * old_Y_step
                 Y_new = Y_new - new_Y_step
                 old_Y_step = new_Y_step
@@ -140,14 +136,11 @@ class NNSolver(nn.Module):
             i = 0
             old_Y_step = 0
             with torch.no_grad():
-                while (i == 0 or torch.max(self._data.get_eq_resid(X, Y_new)) > eps_converge or
-                        torch.max(self._data.get_ineq_resid(X, Y_new)) > eps_converge) and i < max_steps:
+                while (i == 0 or torch.max(self._data.get_resid(X, Y_new)) > eps_converge) and i < max_steps:
                     if partial_corr:
                         Y_step = self._data.get_ineq_partial_grad(X, Y_new)
                     else:
-                        ineq_step = self._data.get_ineq_grad(X, Y_new)
-                        eq_step = self._data.get_eq_grad(X, Y_new)
-                        Y_step = (1 - self._args['softWeightEqFrac']) * ineq_step + self._args['softWeightEqFrac'] * eq_step
+                        Y_step = self._data.get_resid_grad(X, Y_new)
                     new_Y_step = lr * Y_step + momentum * old_Y_step
                     Y_new = Y_new - new_Y_step
                     old_Y_step = new_Y_step
@@ -156,39 +149,30 @@ class NNSolver(nn.Module):
         else:
             return Y
     
-    def set_projection(self, val=True):
-        """set wether to do projection or not"""
-        self._if_project = val
-
-    def apply_projection(self, f, A, b):
-        """project f to satisfy Af<=b"""
-        if self._args['probType'] == 'nonconvex': # efficient computation for input-independent A
-            A = A[0,:,:]
-            return f - (torch.linalg.pinv(A) @ nn.ReLU()(A @ f[:,:,None] - b[:,:,None]))[:,:,0]
-        
-        # return f - (torch.linalg.pinv(A) @ nn.ReLU()(A @ f[:,:,None] - b[:,:,None]))[:,:,0]
-        # listsq is more stable than pinv
-        return f - torch.linalg.lstsq(A, nn.ReLU()(A @ f[:,:,None] - b[:,:,None])).solution[:,:,0]
+    def set_projection(self, val='hardnetaff'):
+        """set what projection to do during testing"""
+        self._testProj = val
+    
+    apply_aff_projection = HardNetAff.apply_projection
+    get_opt = HardNetCvx.get_opt
+    apply_cvx_projection = HardNetCvx.apply_projection
 
     def forward(self, x, isTest=False):
         encoded_x = self._data.encode_input(x)
-        out = self.net(encoded_x)
+        out = self._net(encoded_x)
         # completion
         if self._args['useCompl']:
             out = self._data.complete_partial(x, out)
-        else:
-            out = self._data.process_output(x, out)
         # correction
         out = self.grad_steps(x, out)
         if isTest:
             out = self.extra_grad_steps(x, out)
         
-        if self._if_project:
-            out = out[:, self._data.partial_vars]
-            A_eff, b_eff = self._data.get_Ab_effective(x)
-            out = self.apply_projection(out, A_eff, b_eff)
-            out = self._data.complete_partial(x, out)
-
+        if isTest and self._testProj == 'hardnetaff':
+            out = self.apply_aff_projection(out, x)
+        elif isTest and self._testProj == 'hardnetcvx':
+            out = self.apply_cvx_projection(out, x)
+        
         return out
 
 if __name__=='__main__':

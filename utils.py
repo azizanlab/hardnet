@@ -17,18 +17,12 @@ DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cp
 
 def add_common_args(parser):
     """add common arguments to parser"""
-    parser.add_argument('--probType', type=str, default='nonconvex',
-        choices=['toy', 'toyfull', 'qp', 'nonconvex', 'cbf'], help='problem type')
+    parser.add_argument('--probType', type=str, default='pwc',
+        choices=['pwc', 'pwcfull', 'pwcbox', 'opt', 'cbf'], help='problem type')
     parser.add_argument('--suffix', type=str, default='',
         help='suffix for method name (start with _)')
     parser.add_argument('--seed', type=int, default=123,
         help='random seed for reproducibility')
-    parser.add_argument('--nVar', type=int, 
-        help='number of decision vars')
-    parser.add_argument('--nIneq', type=int,
-        help='number of inequality constraints')
-    parser.add_argument('--nEq', type=int,
-        help='number of equality constraints')
     parser.add_argument('--nEx', type=int,
         help='total number of datapoints')
     parser.add_argument('--epochs', type=int,
@@ -41,12 +35,12 @@ def add_common_args(parser):
         help='hidden layer size for neural network')
     parser.add_argument('--saveAllStats', type=bool,
         help='whether to save all stats, or just those from latest epoch')
-    parser.add_argument('--resultsSaveFreq', type=int,
+    parser.add_argument('--resultsSaveFreq', type=int, default=100,
         help='how frequently (in terms of number of epochs) to save stats to file')
+    parser.add_argument('--evalFreq', type=int, default=1,
+        help='how frequently (in terms of number of epochs) to evaluate the learned model over the valid/test set')
     parser.add_argument('--softWeight', type=float,
-        help='total weight given to constraint violations in loss')
-    parser.add_argument('--softWeightEqFrac', type=float,
-        help='fraction of weight given to equality constraints (vs. inequality constraints) in loss')
+        help='weight given to the regularization term in loss for penalizing constraint violations')
     return parser
 
 def get_dict_from_parser(parser, method_name):
@@ -62,8 +56,7 @@ def load_data(args, device):
     """Load data, and put on GPU if needed"""
     prob_type = args['probType']
     filepath = os.path.join(
-        'datasets', prob_type, f"{prob_type}_dataset_var{args['nVar']}"\
-        f"_ineq{args['nIneq']}_eq{args['nEq']}_ex{args['nEx']}"
+        'datasets', prob_type, f"{prob_type}_dataset_ex{args['nEx']}"
     )
     with open(filepath, 'rb') as f:
         sys.path.append('./datasets/'+prob_type)
@@ -91,29 +84,40 @@ def agg_dict(stats, key, value, op='concat'):
     else:
         stats[key] = value
 
-def record_stats(stats, runtime, eval_metric, ineq_err, eq_err, prefix):
+def record_stats(stats, runtime, eval_metric, err1, err2, prefix):
     make_prefix = lambda x: f"{prefix}_{x}"
     agg_dict(stats, make_prefix('time'), runtime, op='sum')
-    # agg_dict(stats, make_prefix('time_sep'), np.array([runtime]))
     agg_dict(stats, make_prefix('eval'), eval_metric)
-    agg_dict(stats, make_prefix('ineq_max'), np.max(ineq_err, axis=1))
-    agg_dict(stats, make_prefix('ineq_mean'), np.mean(ineq_err, axis=1))
-    agg_dict(stats, make_prefix('ineq_nviol'), np.sum(ineq_err > 1e-4, axis=1))
-    agg_dict(stats, make_prefix('eq_max'), np.max(eq_err, axis=1))
-    agg_dict(stats, make_prefix('eq_mean'), np.mean(eq_err, axis=1))
-    agg_dict(stats, make_prefix('eq_nviol'), np.sum(eq_err > 1e-4, axis=1))
+    agg_dict(stats, make_prefix('err1_max'), np.max(err1, axis=1))
+    agg_dict(stats, make_prefix('err1_mean'), np.mean(err1, axis=1))
+    agg_dict(stats, make_prefix('err1_nviol'), np.sum(err1 > 1e-4, axis=1))
+    agg_dict(stats, make_prefix('err2_max'), np.max(err2, axis=1))
+    agg_dict(stats, make_prefix('err2_mean'), np.mean(err2, axis=1))
+    agg_dict(stats, make_prefix('err2_nviol'), np.sum(err2 > 1e-4, axis=1))
     return stats
 
 def eval_net(data, X, Ytarget, net, args, prefix, stats):
-    start_time = time.time()
-    Y = net(X, isTest=True)
-    runtime = time.time() - start_time
+    with torch.no_grad():
+        _ = net(X, isTest=True) # warm up once so autotuners do not pollute timing
+
+        if torch.cuda.is_available():
+            starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize() # clear any previous work
+            starter.record()
+            Y = net(X, isTest=True)
+            ender.record()
+            torch.cuda.synchronize()
+            runtime = starter.elapsed_time(ender) / 1000.0 # convert to seconds
+        else:
+            start_time = time.time()
+            Y = net(X, isTest=True)
+            runtime = time.time() - start_time
 
     eval_metric = data.get_eval_metric(net, X, Y, Ytarget).detach().cpu().numpy()
-    ineq_err = data.get_ineq_error(net, X, Y, Ytarget).detach().cpu().numpy()
-    eq_err = data.get_eq_error(net, X, Y, Ytarget).detach().cpu().numpy()
+    err1 = data.get_err_metric1(net, X, Y, Ytarget).detach().cpu().numpy()
+    err2 = data.get_err_metric2(net, X, Y, Ytarget).detach().cpu().numpy()
 
-    return record_stats(stats, runtime, eval_metric, ineq_err, eq_err, prefix)
+    return record_stats(stats, runtime, eval_metric, err1, err2, prefix)
 
 def train_net(data, args, net_cls, save_dir, net_modifier_fn=None):
     solver_step = args['lr']
@@ -156,33 +160,35 @@ def train_net(data, args, net_cls, save_dir, net_modifier_fn=None):
             train_time = time.time() - start_time
             agg_dict(epoch_stats, 'train_loss', train_loss.detach().cpu().numpy())
             agg_dict(epoch_stats, 'train_time', train_time, op='sum')
-
-        # Eval over valid set
-        net.eval()
-        for Xvalid, Ytarget_valid in valid_loader:
-            Xvalid = Xvalid.to(DEVICE)
-            Ytarget_valid = Ytarget_valid.to(DEVICE)
-            eval_net(data, Xvalid, Ytarget_valid, net, args, 'valid', epoch_stats)
-
-        # # Eval over test set
-        # net.eval()
-        # for Xtest, Ytarget_test in test_loader:
-        #     Xtest = Xtest.to(DEVICE)
-        #     Ytarget_test = Ytarget_test.to(DEVICE)
-        #     eval_net(data, Xtest, Ytarget_test, net, args, 'test', epoch_stats)
         
         # Print results
-        print(
-            f"Epoch {epoch}: train loss {np.mean(epoch_stats['train_loss']):.2f},"\
-            f"train time {np.mean(epoch_stats['train_time']):.3f},"\
-            f"eval {np.mean(epoch_stats['valid_eval']):.2f}, "\
-            f"ineq max {np.mean(epoch_stats['valid_ineq_max']):.2f}, "\
-            f"ineq mean {np.mean(epoch_stats['valid_ineq_mean']):.2f}, "\
-            f"ineq nviol {np.mean(epoch_stats['valid_ineq_nviol']):.2f}, "\
-            f"eq max {np.mean(epoch_stats['valid_eq_max']):.2f}, "\
-            f"eq nviol {np.mean(epoch_stats['valid_eq_nviol']):.2f}, "\
-            f"time {np.mean(epoch_stats['valid_time']):.3f}"
-        )
+        print(f"Epoch {epoch}: train loss {np.mean(epoch_stats['train_loss']):.2f},"\
+              f"train time {np.mean(epoch_stats['train_time']):.3f}")
+        
+        if epoch % args['evalFreq'] == 0:
+            # Eval over valid set
+            net.eval()
+            for Xvalid, Ytarget_valid in valid_loader:
+                Xvalid = Xvalid.to(DEVICE)
+                Ytarget_valid = Ytarget_valid.to(DEVICE)
+                eval_net(data, Xvalid, Ytarget_valid, net, args, 'valid', epoch_stats)
+
+            # # Eval over test set
+            # net.eval()
+            # for Xtest, Ytarget_test in test_loader:
+            #     Xtest = Xtest.to(DEVICE)
+            #     Ytarget_test = Ytarget_test.to(DEVICE)
+            #     eval_net(data, Xtest, Ytarget_test, net, args, 'test', epoch_stats)
+
+            print(f"eval {np.mean(epoch_stats['valid_eval']):.2f}, "\
+                f"err1 max {np.mean(epoch_stats['valid_err1_max']):.2f}, "\
+                f"err1 mean {np.mean(epoch_stats['valid_err1_mean']):.2f}, "\
+                f"err1 nviol {np.mean(epoch_stats['valid_err1_nviol']):.2f}, "\
+                f"err2 max {np.mean(epoch_stats['valid_err2_max']):.2f}, "\
+                f"err2 mean {np.mean(epoch_stats['valid_err2_mean']):.2f}, "\
+                f"err2 nviol {np.mean(epoch_stats['valid_err2_nviol']):.2f}, "\
+                f"time {np.mean(epoch_stats['valid_time']):.3f}"
+            )
 
         if args['saveAllStats']:
             if epoch == 0:
@@ -244,6 +250,7 @@ def aggregate_for_method(method_name, path_method, exp_status_dict, stats_dict, 
     
     # get status and stats
     for inst in instances:
+        print(f'  Reading {inst}...')
         result_dir = os.path.join(path_method, inst)
         is_done, stats = check_running_done(result_dir, 'Opt' in method_name, total_epoch)
         if is_done:
@@ -256,7 +263,7 @@ def aggregate_for_method(method_name, path_method, exp_status_dict, stats_dict, 
     # aggregate metrics
     d = {}
     if len(method_stats) > 0:
-        metrics = method_stats[1].keys()
+        metrics = method_stats[0].keys()
         if 'Opt' not in method_name:
             for metric in metrics:
                 d[metric] = get_mean_std_nets(method_stats, metric)
@@ -288,7 +295,7 @@ def check_running_done(path, is_opt=False, total_epoch=1000):
                 with open(os.path.join(path, 'test_stats.dict'), 'rb') as f:
                     test_stats = pickle.load(f)
                 stats.update(test_stats)
-                is_done = (len(stats['valid_time']) >= total_epoch)
+                is_done = ('baselineCBFQP' in path or len(stats['valid_time']) >= total_epoch)
                 if not is_done:
                     print(path)
                     print(f"Not enough epochs! Last epoch: {len(stats['valid_time'])}")

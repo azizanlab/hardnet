@@ -233,7 +233,7 @@ class SafeControl:
         self._Q = torch.tensor(Q)
         self._R = torch.tensor(R)
         self._X = torch.tensor(X)
-        self._Y = torch.zeros(X.shape[0], 0)
+        self._Y = torch.zeros(X.shape[0], 0) # unsupervised learning
         self._sys = sys
         self._obs_list = obs_list
         self._loss_max = loss_max
@@ -244,7 +244,6 @@ class SafeControl:
         self._ydim = sys.control_dim
         self._partial_vars = np.arange(self._ydim)
         self._num = X.shape[0]
-        self._nineq = len(obs_list)
         self._neq = 0
         self._nknowns = 0
         self._valid_frac = valid_frac
@@ -254,7 +253,7 @@ class SafeControl:
         self._device = None
 
     def __str__(self):
-        return f'SafeControl-{self.ydim}-{self.nineq}-{self.neq}-{self.num}'
+        return f'SafeControl-{self.num}'
 
     @property
     def Q(self):
@@ -321,10 +320,6 @@ class SafeControl:
         return self._neq
 
     @property
-    def nineq(self):
-        return self._nineq
-
-    @property
     def nknowns(self):
         return self._nknowns
 
@@ -378,21 +373,9 @@ class SafeControl:
         U = Y + self.get_nominal_control(X)
         return ((X@self.Q)*X).sum(dim=1) + ((U@self.R)*U).sum(dim=1)
 
-    def get_ineq_resid(self, X, Y):
-        A, b = self.get_Ab_effective(X)
-        return torch.clamp((A@Y[:,:,None])[:,:,0] - b, 0)
-
-    def get_eq_resid(self, X, Y):
-        """one imaginary equality constraint 0 = 0"""
-        return torch.zeros(X.shape[0], 1, dtype=X.dtype, device=X.device)
-
-    def get_ineq_grad(self, X, Y):
-        A, b = self.get_Ab_effective(X)
-        ineq_resid = self.get_ineq_resid(X, Y)
-        return 2*(ineq_resid[:,None,:]@A)[:,0,:]
-
-    def get_eq_grad(self, X, Y):
-        return torch.zeros(X.shape[0], self._ydim, dtype=X.dtype, device=X.device)
+    def get_resid(self, X, Y):
+        A, bl, bu = self.get_coefficients(X)
+        return torch.clamp((A@Y[:,:,None])[:,:,0] - bu, 0)
     
     def run_episode(self, net, X, accum_fn, nstep=None, dt=None, isTest=False, saveTraj=False, accum_max=None):
         """run one episode of simulation while accumulating cost up to accum_max"""
@@ -423,10 +406,8 @@ class SafeControl:
 
     def get_train_loss_step(self, X, Y, args):
         main_loss = self.evaluate(X, Y)
-        ineq_loss = torch.norm(self.get_ineq_resid(X, Y), dim=1)**2
-        eq_loss = torch.norm(self.get_eq_resid(X, Y), dim=1)**2
-        return main_loss + args['softWeight'] * (1 - args['softWeightEqFrac']) * ineq_loss + \
-            args['softWeight'] * args['softWeightEqFrac'] * eq_loss
+        regularization = torch.norm(self.get_resid(X, Y), dim=1)**2
+        return main_loss + args['softWeight'] * regularization
     
     def get_train_loss(self, net, X, Ytarget, args):
         accum_fn = lambda X, Y: self.get_train_loss_step(X, Y, args)
@@ -435,14 +416,14 @@ class SafeControl:
     def get_eval_metric(self, net, X, Y, Ytarget):
         return self.run_episode(net, X, self.evaluate, isTest=True)[0]
     
-    def get_ineq_error(self, net, X, Y, Ytarget):
-        return self.run_episode(net, X, self.get_ineq_resid, isTest=True)[0]
+    def get_err_metric1(self, net, X, Y, Ytarget):
+        return self.run_episode(net, X, self.get_resid, isTest=True)[0]
     
-    def get_eq_error(self, net, X, Y, Ytarget):
-        return self.run_episode(net, X, self.get_eq_resid, isTest=True)[0]
+    def get_err_metric2(self, net, X, Y, Ytarget):
+        return torch.zeros(X.shape[0], 1, dtype=X.dtype, device=X.device)
 
-    def get_Ab_effective(self, X):
-        """compute coefficients A(x), b(x) for safety conditoin Au<=b"""
+    def get_coefficients(self, X):
+        """coefficients for inequality constraints bl(x)<=A_eff(x)y<=bu(x)"""
         h_list = []
         h_grad_list = []
         for obs in self._obs_list:
@@ -455,17 +436,22 @@ class SafeControl:
 
         g = self._sys.get_g(X)
         A = - h_grad_concat @ g
-        b = (h_grad_concat @ (g @ self.get_nominal_control(X)[:,:,None]\
+        bu = (h_grad_concat @ (g @ self.get_nominal_control(X)[:,:,None]\
                                 + self._sys.get_f(X)[:,:,None]))[:,:,0]\
             + self._alpha * h_concat
-        return A, b
+        largeNum = 1e10
+        bl = torch.zeros(X.shape[0], bu.shape[1], device=self.device) - largeNum
+        return A, bl, bu
 
+    ##### For DC3 #####
+
+    def get_resid_grad(self, X, Y):
+        A, bl, bu = self.get_coefficients(X)
+        resid = torch.clamp((A@Y[:,:,None])[:,:,0] - bu, 0)
+        return 2*(resid[:,None,:]@A)[:,0,:]
+    
     def get_ineq_partial_grad(self, X, Y):
         return NotImplementedError
-
-    # Processes intermediate neural network output
-    def process_output(self, X, Y):
-        return Y
 
     # Solves for the full set of variables
     def complete_partial(self, X, Z):

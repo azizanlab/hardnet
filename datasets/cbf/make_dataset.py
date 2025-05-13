@@ -5,7 +5,7 @@ import torch
 import sys
 import os
 sys.path.insert(1, os.path.join(sys.path[0], os.pardir, os.pardir))
-from safe_control import Obstacle, Unicycle, Unicycle_Acc, SafeControl
+from safe_control import Obstacle, Unicycle_Acc, SafeControl
 
 import os
 os.environ['KMP_DUPLICATE_LIB_OK']='True'
@@ -14,7 +14,7 @@ torch.set_default_dtype(torch.float64)
 
 def generate_cbf_dataset(num_examples):
     np.random.seed(17)
-    loss_max, alpha, kappa, T, dt = 20000, 20, 10, 1.0, 0.02
+    loss_max, alpha, kappa, T, dt = 20000, 20, 10, 1.0, 0.02 # alpha 10 kappa 5
 
     Q = np.diag([100, 100, 0.0, 0.1, 0.1])
     R = np.diag([0.1, 0.1])
@@ -25,7 +25,6 @@ def generate_cbf_dataset(num_examples):
     obs_param_list = [(-2.25, 0.5, 0.5, 0.75), (-0.8, 0., 0.5, 0.5)]
     obs_list = []
     num_obs = len(obs_param_list)
-    print(f"neq:{num_obs}, eq:{0}")
     for i in range(num_obs):
         obs_list.append(Obstacle(*obs_param_list[i]))
 
@@ -44,7 +43,7 @@ def generate_cbf_dataset(num_examples):
     problem = SafeControl(Q, R, X, sys, obs_list, loss_max, alpha, T, dt)
     print(f"problem length:{num_examples} examples with {int(T/dt)} steps")
 
-    with open(f"./cbf_dataset_var{sys.control_dim}_ineq{num_obs}_eq{0}_ex{num_examples}", 'wb') as f:
+    with open(f"./cbf_dataset_ex{num_examples}", 'wb') as f:
         pickle.dump(problem, f)
 
 num_examples = 1000

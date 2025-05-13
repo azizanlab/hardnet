@@ -27,16 +27,13 @@ def main():
 
     ## Run pure optimization baselines
     prob_type = args['probType']
-    if prob_type == 'qp':
-        solvers = ['osqp']
-    elif prob_type == 'nonconvex':
+    if prob_type == 'opt':
         solvers = ['gekko']
     else:
         raise NotImplementedError
 
     for solver in solvers:
-        save_dir = os.path.join('results', str(data), name+'_{}'.format(solver),
-            time.strftime("%y%m%d-%H%M%S", time.localtime(time.time())))
+        save_dir = os.path.join('results', str(data), name+'_{}'.format(solver), f"seed{args['seed']}")
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
         opt_results = {}
@@ -62,11 +59,9 @@ def get_args(name):
 
 def get_opt_results(results, data, X, Y, Ytarget, time, prefix):
     eval_metric = data.get_eval_metric(None, X, Y, Ytarget).detach().cpu().numpy()
-    ineq_err = data.get_ineq_error(None, X, Y, Ytarget).detach().cpu().numpy()
-    eq_err = data.get_eq_error(None, X, Y, Ytarget).detach().cpu().numpy()
-    results = record_stats(results, time, eval_metric, ineq_err, eq_err, prefix)
-
-    return results
+    err1 = data.get_err_metric1(None, X, Y, Ytarget).detach().cpu().numpy()
+    err2 = data.get_err_metric2(None, X, Y, Ytarget).detach().cpu().numpy()
+    return record_stats(results, time, eval_metric, err1, err2, prefix)
 
 if __name__=='__main__':
     main()

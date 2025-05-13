@@ -21,16 +21,17 @@ import hardnet_aff
 import hardnet_cvx
 import baseline_dc3
 import baseline_nn
+import baseline_cbfqp
 
 DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 
 def main():
     parser = argparse.ArgumentParser(description='testNets')
-    parser.add_argument('--probType', type=str, default='nonconvex',
-        choices=['toy', 'toyfull', 'qp', 'nonconvex', 'cbf'], help='problem type')
+    parser.add_argument('--probType', type=str, default='pwc',
+        choices=['pwc', 'pwcfull', 'pwcbox', 'opt', 'cbf'], help='problem type')
     parser.add_argument('--expDir', type=str,
-        help='path for experimental results ex)results/NonconvexProblem-100-50-50-10000')
+        help='path for experimental results ex)results/NonconvexOpt-10000')
     args = parser.parse_args()
     args = vars(args) # change to dictionary
     test_results(args['expDir'], args['probType'])
@@ -51,13 +52,19 @@ def load_net_hardnetcvx(data, args, path):
     return net
 
 def load_net_dc3(data, args, path):
-    net = baseline_dc3.NNSolver(data, args).to(DEVICE)
+    net = baseline_dc3.DC3(data, args).to(DEVICE)
     with open(os.path.join(path), 'rb') as f:
         net.load_state_dict(torch.load(f, map_location=DEVICE))
     return net
 
 def load_net_nn(data, args, path):
-    net = baseline_nn.TestProjNet(data, args).to(DEVICE)
+    net = baseline_nn.NN(data, args).to(DEVICE)
+    with open(os.path.join(path), 'rb') as f:
+        net.load_state_dict(torch.load(f, map_location=DEVICE))
+    return net
+
+def load_net_cbfqp(data, args, path):
+    net = baseline_cbfqp.CBFQP(data, args).to(DEVICE)
     with open(os.path.join(path), 'rb') as f:
         net.load_state_dict(torch.load(f, map_location=DEVICE))
     return net
@@ -77,7 +84,7 @@ def test_results(exp_dir, prob_type):
     args = hardnet_aff.get_args('hardnetAff')
     data = load_data(args, DEVICE)
     test_dataset = TensorDataset(data.testX, data.testY)
-    test_loader = DataLoader(test_dataset, batch_size=100, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=len(test_dataset), shuffle=False)
     
     if os.path.exists(exp_dir):
         ## Get mapping of subdirs to methods
@@ -116,6 +123,10 @@ def test_results(exp_dir, prob_type):
                             sys.argv = ['baseline_nn.py', '--probType', prob_type]
                         args = baseline_nn.get_args('baselineNN')
                         net = load_net_nn(data, args, file_path)
+                    elif 'baselineCBFQP' in method:
+                        sys.argv = ['baseline_cbfqp.py', '--probType', prob_type]
+                        args = baseline_cbfqp.get_args('baselineCBFQP')
+                        net = load_net_cbfqp(data, args, file_path)
                     else:
                         print(f'Testing for {method} is not supported.')
                         continue
@@ -134,6 +145,9 @@ def test_results(exp_dir, prob_type):
                     
                     with open(os.path.join(result_dir, 'test_stats.dict'), 'wb') as f:
                         pickle.dump(stats, f)
+                    
+                    del net
+                    torch.cuda.empty_cache()
                 else:
                     print(f'Not Found: {file_path}')
 
